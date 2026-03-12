@@ -1,5 +1,6 @@
 // src/main.rs — BLE Peripheral with Servo (ESP32-C3)
 use esp32_nimble::{uuid128, BLEAdvertisementData, BLEDevice, NimbleProperties};
+use esp_idf_hal::ledc::Resolution;
 use esp_idf_hal::{
     delay::FreeRtos,
     ledc::{config::TimerConfig, LedcDriver, LedcTimerDriver},
@@ -7,7 +8,6 @@ use esp_idf_hal::{
     units::Hertz,
 };
 use std::sync::{Arc, Mutex};
-use esp_idf_hal::ledc::Resolution;
 
 const SERVO_OPEN: u32 = 180;
 const SERVO_CLOSE: u32 = 70;
@@ -50,7 +50,9 @@ fn main() -> anyhow::Result<()> {
 
     let timer = LedcTimerDriver::new(
         peripherals.ledc.timer0,
-        &TimerConfig::default().frequency(Hertz(50)).resolution(Resolution::Bits14),
+        &TimerConfig::default()
+            .frequency(Hertz(50))
+            .resolution(Resolution::Bits14),
     )?;
     let servo = Arc::new(Mutex::new(LedcDriver::new(
         peripherals.ledc.channel0,
@@ -59,6 +61,9 @@ fn main() -> anyhow::Result<()> {
     )?));
 
     set_angle(&mut servo.lock().unwrap(), SERVO_OPEN);
+
+    let (servo_tx, servo_rx) = std::sync::mpsc::channel::<String>();
+    let servo_tx = Arc::new(Mutex::new(servo_tx));
 
     let ble_device = BLEDevice::take();
     let server = ble_device.get_server();
@@ -70,7 +75,6 @@ fn main() -> anyhow::Result<()> {
         log::info!("Disconnected: reason={:?}", reason);
         BLEDevice::take().get_advertising().lock().start().unwrap();
     });
-    
 
     let service = server.create_service(uuid128!("921a6069-4357-4287-a9af-fd386fc0dcad"));
     let characteristic = service.lock().create_characteristic(
@@ -78,20 +82,12 @@ fn main() -> anyhow::Result<()> {
         NimbleProperties::READ | NimbleProperties::WRITE | NimbleProperties::NOTIFY,
     );
 
-    let char_handle = characteristic.clone();
-    let servo_handle = servo.clone();
-
     characteristic.lock().on_write(move |args| {
-        let incoming = std::str::from_utf8(args.recv_data()).unwrap_or("");
+        let incoming = std::str::from_utf8(args.recv_data())
+            .unwrap_or("")
+            .to_string();
         log::info!("<-- Received: {}", incoming);
-
-        let mut srv = servo_handle.lock().unwrap();
-        let result = on_msg(&mut srv, incoming);
-        let response = format!("Received: '{}': {}", incoming, result);
-
-        log::info!("--> Sent: {}", response);
-        char_handle.lock().set_value(response.as_bytes());
-        char_handle.lock().notify();
+        servo_tx.lock().unwrap().send(incoming).ok();
     });
 
     let advertising = ble_device.get_advertising();
@@ -103,11 +99,12 @@ fn main() -> anyhow::Result<()> {
     advertising.lock().start()?;
     log::info!("Advertising...");
 
-    
-
-
     loop {
-        log::info!("Advertising...");
-        FreeRtos::delay_ms(1000);
+        if let Ok(cmd) = servo_rx.try_recv() {
+            let mut srv = servo.lock().unwrap();
+            let result = on_msg(&mut srv, &cmd);
+            log::info!("--> Action: {}", result);
+        }
+        FreeRtos::delay_ms(10);
     }
 }
